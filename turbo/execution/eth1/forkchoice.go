@@ -11,6 +11,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/rawdbv3"
 	"github.com/ledgerwatch/erigon/core/rawdb"
+	"github.com/ledgerwatch/erigon/eth/stagedsync"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 )
 
@@ -69,7 +70,7 @@ func (e *EthereumExecutionModule) UpdateForkChoice(ctx context.Context, req *exe
 	safeHash := gointerfaces.ConvertH256ToHash(req.SafeBlockHash)
 	finalizedHash := gointerfaces.ConvertH256ToHash(req.FinalizedBlockHash)
 
-	outcomeCh := make(chan forkchoiceOutcome)
+	outcomeCh := make(chan forkchoiceOutcome, 1)
 
 	// So we wait at most the amount specified by req.Timeout before just sending out
 	go e.updateForkChoice(ctx, blockHash, safeHash, finalizedHash, outcomeCh)
@@ -125,6 +126,10 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 	fcuHeader, err := e.blockReader.HeaderByHash(ctx, tx, blockHash)
 	if err != nil {
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	if fcuHeader == nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, fmt.Errorf("forkchoice: block %x not found or was marked invalid", blockHash))
 		return
 	}
 	canonicalHash, err := e.blockReader.CanonicalHash(ctx, tx, fcuHeader.Number.Uint64())
@@ -202,7 +207,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 		}
 	}
 
-	e.executionPipeline.UnwindTo(currentParentNumber, libcommon.Hash{})
+	e.executionPipeline.UnwindTo(currentParentNumber, stagedsync.ForkChoice)
 	if e.historyV3 {
 		if err := rawdbv3.TxNums.Truncate(tx, currentParentNumber); err != nil {
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
@@ -230,6 +235,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 
 	// Run the unwind
 	if err := e.executionPipeline.RunUnwind(e.db, tx); err != nil {
+		err = fmt.Errorf("updateForkChoice: %w", err)
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 		return
 	}
@@ -242,6 +248,25 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 	}
 	// Mark all new canonicals as canonicals
 	for _, canonicalSegment := range newCanonicals {
+		chainReader := stagedsync.NewChainReaderImpl(e.config, tx, e.blockReader, e.logger)
+
+		b := rawdb.ReadBlock(tx, canonicalSegment.hash, canonicalSegment.number)
+
+		if b == nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, fmt.Errorf("unexpected chain cap: %d", canonicalSegment.number))
+			return
+		}
+
+		if err := e.engine.VerifyHeader(chainReader, b.Header(), true); err != nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			return
+		}
+
+		if err := e.engine.VerifyUncles(chainReader, b.Header(), b.Uncles()); err != nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			return
+		}
+
 		if err := rawdb.WriteCanonicalHash(tx, canonicalSegment.hash, canonicalSegment.number); err != nil {
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
@@ -275,6 +300,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 	}
 	// Run the forkchoice
 	if err := e.executionPipeline.Run(e.db, tx, false); err != nil {
+		err = fmt.Errorf("updateForkChoice: %w", err)
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 		return
 	}
@@ -305,7 +331,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			})
 			return
 		}
-		if err := truncateCanonicalChain(ctx, tx, *headNumber+1); err != nil {
+		if err := rawdb.TruncateCanonicalChain(ctx, tx, *headNumber+1); err != nil {
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
 		}
@@ -327,6 +353,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 		}
 
 		if err := e.db.Update(ctx, func(tx kv.RwTx) error { return e.executionPipeline.RunPrune(e.db, tx, false) }); err != nil {
+			err = fmt.Errorf("updateForkChoice: %w", err)
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
 		}

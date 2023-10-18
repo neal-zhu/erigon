@@ -28,6 +28,7 @@ import (
 
 	"github.com/c2h5oh/datasize"
 	"github.com/ledgerwatch/erigon-lib/chain"
+	"github.com/ledgerwatch/erigon-lib/chain/networkname"
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/datadir"
 	"github.com/ledgerwatch/erigon-lib/downloader/downloadercfg"
@@ -39,7 +40,6 @@ import (
 	"github.com/ledgerwatch/erigon/eth/gasprice/gaspricecfg"
 	"github.com/ledgerwatch/erigon/ethdb/prune"
 	"github.com/ledgerwatch/erigon/params"
-	"github.com/ledgerwatch/erigon/params/networkname"
 )
 
 // AggregationStep number of transactions in smallest static file
@@ -101,6 +101,8 @@ var Defaults = Config{
 		KeepBlocks: false,
 		Produce:    true,
 	},
+
+	SilkwormEnabled: false,
 }
 
 func init() {
@@ -234,6 +236,8 @@ type Config struct {
 
 	// No heimdall service
 	WithoutHeimdall bool
+	// Heimdall services active
+	WithHeimdallMilestones bool
 	// Ethstats service
 	Ethstats string
 	// Consensus layer
@@ -247,6 +251,10 @@ type Config struct {
 	OverrideCancunTime *big.Int `toml:",omitempty"`
 
 	ForcePartialCommit bool
+
+	// Embedded Silkworm support
+	SilkwormEnabled bool
+	SilkwormPath    string
 }
 
 type Sync struct {

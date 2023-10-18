@@ -12,12 +12,16 @@ import (
 	"github.com/ledgerwatch/erigon-lib/chain"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/accounts/abi"
-	"github.com/ledgerwatch/erigon/consensus/bor"
 	"github.com/ledgerwatch/erigon/consensus/bor/contract"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality/generics"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality/whitelist"
+	"github.com/ledgerwatch/erigon/consensus/bor/heimdall"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/dataflow"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/erigon/turbo/services"
+	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
 	"github.com/ledgerwatch/log/v3"
 )
 
@@ -30,8 +34,10 @@ type BorHeimdallCfg struct {
 	db               kv.RwDB
 	miningState      MiningState
 	chainConfig      chain.Config
-	heimdallClient   bor.IHeimdallClient
+	heimdallClient   heimdall.IHeimdallClient
 	blockReader      services.FullBlockReader
+	hd               *headerdownload.HeaderDownload
+	penalize         func(context.Context, []headerdownload.PenaltyItem)
 	stateReceiverABI abi.ABI
 }
 
@@ -39,8 +45,10 @@ func StageBorHeimdallCfg(
 	db kv.RwDB,
 	miningState MiningState,
 	chainConfig chain.Config,
-	heimdallClient bor.IHeimdallClient,
+	heimdallClient heimdall.IHeimdallClient,
 	blockReader services.FullBlockReader,
+	hd *headerdownload.HeaderDownload,
+	penalize func(context.Context, []headerdownload.PenaltyItem),
 ) BorHeimdallCfg {
 	return BorHeimdallCfg{
 		db:               db,
@@ -48,6 +56,8 @@ func StageBorHeimdallCfg(
 		chainConfig:      chainConfig,
 		heimdallClient:   heimdallClient,
 		blockReader:      blockReader,
+		hd:               hd,
+		penalize:         penalize,
 		stateReceiverABI: contract.StateReceiver(),
 	}
 }
@@ -61,6 +71,8 @@ func BorHeimdallForward(
 	mine bool,
 	logger log.Logger,
 ) (err error) {
+	processStart := time.Now()
+
 	if cfg.chainConfig.Bor == nil {
 		return
 	}
@@ -80,21 +92,52 @@ func BorHeimdallForward(
 	var header *types.Header
 	var headNumber uint64
 
+	headNumber, err = stages.GetStageProgress(tx, stages.Headers)
+
+	if err != nil {
+		return err
+	}
+
+	service := whitelist.GetWhitelistingService()
+
+	if generics.BorMilestoneRewind.Load() != nil && *generics.BorMilestoneRewind.Load() != 0 {
+		unwindPoint := *generics.BorMilestoneRewind.Load()
+		var reset uint64 = 0
+		generics.BorMilestoneRewind.Store(&reset)
+
+		if service != nil && unwindPoint < headNumber {
+			header, err = cfg.blockReader.HeaderByNumber(ctx, tx, headNumber)
+			logger.Debug("[BorHeimdall] Verification failed for header", "hash", header.Hash(), "height", headNumber, "err", err)
+			cfg.penalize(ctx, []headerdownload.PenaltyItem{
+				{Penalty: headerdownload.BadBlockPenalty, PeerID: cfg.hd.SourcePeerId(header.Hash())}})
+
+			dataflow.HeaderDownloadStates.AddChange(headNumber, dataflow.HeaderInvalidated)
+			s.state.UnwindTo(unwindPoint, ForkReset(header.Hash()))
+			return fmt.Errorf("verification failed for header %d: %x", headNumber, header.Hash())
+		}
+	}
+
 	if mine {
-		header = cfg.miningState.MiningBlock.Header
-		headNumber = header.Number.Uint64()
-	} else {
-		headNumber, err = stages.GetStageProgress(tx, stages.Headers)
+		minedHeader := cfg.miningState.MiningBlock.Header
 
-		if err != nil {
-			return fmt.Errorf("getting headers progress: %w", err)
+		if minedHeadNumber := minedHeader.Number.Uint64(); minedHeadNumber > headNumber {
+			// Whitelist service is called to check if the bor chain is
+			// on the cannonical chain according to milestones
+			if service != nil {
+				if !service.IsValidChain(minedHeadNumber, []*types.Header{minedHeader}) {
+					logger.Debug("[BorHeimdall] Verification failed for mined header", "hash", minedHeader.Hash(), "height", minedHeadNumber, "err", err)
+					dataflow.HeaderDownloadStates.AddChange(minedHeadNumber, dataflow.HeaderInvalidated)
+					s.state.UnwindTo(minedHeadNumber-1, ForkReset(minedHeader.Hash()))
+					return fmt.Errorf("mining on a wrong fork %d:%x", minedHeadNumber, minedHeader.Hash())
+				}
+			}
+		} else {
+			return fmt.Errorf("attempting to mine %d, which is behind current head: %d", minedHeadNumber, headNumber)
 		}
+	}
 
-		header, err = cfg.blockReader.HeaderByNumber(ctx, tx, headNumber)
-
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return fmt.Errorf("getting headers progress: %w", err)
 	}
 
 	if s.BlockNumber == headNumber {
@@ -127,26 +170,76 @@ func BorHeimdallForward(
 	if cfg.blockReader.FrozenBorBlocks() > lastBlockNum {
 		lastBlockNum = cfg.blockReader.FrozenBorBlocks()
 	}
-	for blockNum := lastBlockNum + 1; blockNum <= headNumber; blockNum++ {
-		if blockNum%cfg.chainConfig.Bor.CalculateSprint(blockNum) == 0 {
-			if lastEventId, err = fetchAndWriteBorEvents(ctx, cfg.blockReader, cfg.chainConfig.Bor, header, lastEventId, cfg.chainConfig.ChainID.String(), tx, cfg.heimdallClient, cfg.stateReceiverABI, s.LogPrefix(), logger); err != nil {
+
+	if !mine {
+		logger.Info("["+s.LogPrefix()+"] Processng sync events...", "from", lastBlockNum+1)
+	}
+
+	var blockNum uint64
+	var fetchTime time.Duration
+	var eventRecords int
+	var lastSpanId uint64
+
+	logTimer := time.NewTicker(30 * time.Second)
+	defer logTimer.Stop()
+
+	for blockNum = lastBlockNum + 1; blockNum <= headNumber; blockNum++ {
+		select {
+		default:
+		case <-logTimer.C:
+			logger.Info("["+s.LogPrefix()+"] StateSync Progress", "progress", blockNum, "lastSpanId", lastSpanId, "lastEventId", lastEventId, "total records", eventRecords, "fetch time", fetchTime, "process time", time.Since(processStart))
+		}
+
+		if !mine {
+			header, err = cfg.blockReader.HeaderByNumber(ctx, tx, blockNum)
+			if err != nil {
 				return err
 			}
+
+			// Whitelist service is called to check if the bor chain is
+			// on the cannonical chain according to milestones
+			if service != nil {
+				if !service.IsValidChain(blockNum, []*types.Header{header}) {
+					logger.Debug("["+s.LogPrefix()+"] Verification failed for header", "height", blockNum, "hash", header.Hash())
+					cfg.penalize(ctx, []headerdownload.PenaltyItem{
+						{Penalty: headerdownload.BadBlockPenalty, PeerID: cfg.hd.SourcePeerId(header.Hash())}})
+					dataflow.HeaderDownloadStates.AddChange(blockNum, dataflow.HeaderInvalidated)
+					s.state.UnwindTo(blockNum-1, ForkReset(header.Hash()))
+					return fmt.Errorf("verification failed for header %d: %x", blockNum, header.Hash())
+				}
+			}
 		}
+
+		if blockNum%cfg.chainConfig.Bor.CalculateSprint(blockNum) == 0 {
+			var callTime time.Duration
+			var records int
+			if lastEventId, records, callTime, err = fetchAndWriteBorEvents(ctx, cfg.blockReader, cfg.chainConfig.Bor, header, lastEventId, cfg.chainConfig.ChainID.String(), tx, cfg.heimdallClient, cfg.stateReceiverABI, s.LogPrefix(), logger); err != nil {
+				return err
+			}
+
+			eventRecords += records
+			fetchTime += callTime
+		}
+
 		if blockNum == 1 || (blockNum > zerothSpanEnd && ((blockNum-zerothSpanEnd-1)%spanLength) == 0) {
-			if err = fetchAndWriteSpans(ctx, blockNum, tx, cfg.heimdallClient, s.LogPrefix(), logger); err != nil {
+			if lastSpanId, err = fetchAndWriteSpans(ctx, blockNum, tx, cfg.heimdallClient, s.LogPrefix(), logger); err != nil {
 				return err
 			}
 		}
 	}
+
 	if err = s.Update(tx, headNumber); err != nil {
 		return err
 	}
+
 	if !useExternalTx {
 		if err = tx.Commit(); err != nil {
 			return err
 		}
 	}
+
+	logger.Info("["+s.LogPrefix()+"] Sync events processed", "progress", blockNum-1, "lastSpanId", lastSpanId, "lastEventId", lastEventId, "total records", eventRecords, "fetch time", fetchTime, "process time", time.Since(processStart))
+
 	return
 }
 
@@ -158,11 +251,11 @@ func fetchAndWriteBorEvents(
 	lastEventId uint64,
 	chainID string,
 	tx kv.RwTx,
-	heimdallClient bor.IHeimdallClient,
+	heimdallClient heimdall.IHeimdallClient,
 	stateReceiverABI abi.ABI,
 	logPrefix string,
 	logger log.Logger,
-) (uint64, error) {
+) (uint64, int, time.Duration, error) {
 	fetchStart := time.Now()
 
 	// Find out the latest eventId
@@ -179,22 +272,23 @@ func fetchAndWriteBorEvents(
 	} else {
 		pHeader, err := blockReader.HeaderByNumber(ctx, tx, blockNum-config.CalculateSprint(blockNum))
 		if err != nil {
-			return lastEventId, err
+			return lastEventId, 0, time.Since(fetchStart), err
 		}
 		to = time.Unix(int64(pHeader.Time), 0)
 	}
 
 	from = lastEventId + 1
 
-	logger.Info(
+	logger.Debug(
 		fmt.Sprintf("[%s] Fetching state updates from Heimdall", logPrefix),
 		"fromID", from,
 		"to", to.Format(time.RFC3339),
 	)
 
 	eventRecords, err := heimdallClient.StateSyncEvents(ctx, from, to.Unix())
+
 	if err != nil {
-		return lastEventId, err
+		return lastEventId, 0, time.Since(fetchStart), err
 	}
 
 	if config.OverrideStateSyncRecords != nil {
@@ -202,9 +296,6 @@ func fetchAndWriteBorEvents(
 			eventRecords = eventRecords[0:val]
 		}
 	}
-
-	fetchTime := time.Since(fetchStart)
-	processStart := time.Now()
 
 	if len(eventRecords) > 0 {
 		var key, val [8]byte
@@ -214,37 +305,37 @@ func fetchAndWriteBorEvents(
 	const method = "commitState"
 
 	wroteIndex := false
-	for _, eventRecord := range eventRecords {
+	for i, eventRecord := range eventRecords {
 		if eventRecord.ID <= lastEventId {
 			continue
 		}
 		if lastEventId+1 != eventRecord.ID || eventRecord.ChainID != chainID || !eventRecord.Time.Before(to) {
-			return lastEventId, fmt.Errorf("invalid event record received blockNum=%d, eventId=%d (exp %d), chainId=%s (exp %s), time=%s (exp to %s)", blockNum, eventRecord.ID, lastEventId+1, eventRecord.ChainID, chainID, eventRecord.Time, to)
+			return lastEventId, i, time.Since(fetchStart), fmt.Errorf("invalid event record received blockNum=%d, eventId=%d (exp %d), chainId=%s (exp %s), time=%s (exp to %s)", blockNum, eventRecord.ID, lastEventId+1, eventRecord.ChainID, chainID, eventRecord.Time, to)
 		}
 
 		eventRecordWithoutTime := eventRecord.BuildEventRecord()
 
 		recordBytes, err := rlp.EncodeToBytes(eventRecordWithoutTime)
 		if err != nil {
-			return lastEventId, err
+			return lastEventId, i, time.Since(fetchStart), err
 		}
 
 		data, err := stateReceiverABI.Pack(method, big.NewInt(eventRecord.Time.Unix()), recordBytes)
 		if err != nil {
 			logger.Error(fmt.Sprintf("[%s] Unable to pack tx for commitState", logPrefix), "err", err)
-			return lastEventId, err
+			return lastEventId, i, time.Since(fetchStart), err
 		}
 		var eventIdBuf [8]byte
 		binary.BigEndian.PutUint64(eventIdBuf[:], eventRecord.ID)
 		if err = tx.Put(kv.BorEvents, eventIdBuf[:], data); err != nil {
-			return lastEventId, err
+			return lastEventId, i, time.Since(fetchStart), err
 		}
 		if !wroteIndex {
 			var blockNumBuf [8]byte
 			binary.BigEndian.PutUint64(blockNumBuf[:], blockNum)
 			binary.BigEndian.PutUint64(eventIdBuf[:], eventRecord.ID)
 			if err = tx.Put(kv.BorEventNums, blockNumBuf[:], eventIdBuf[:]); err != nil {
-				return lastEventId, err
+				return lastEventId, i, time.Since(fetchStart), err
 			}
 			wroteIndex = true
 		}
@@ -252,40 +343,36 @@ func fetchAndWriteBorEvents(
 		lastEventId++
 	}
 
-	processTime := time.Since(processStart)
-
-	logger.Info(fmt.Sprintf("[%s] StateSyncData", logPrefix), "number", blockNum, "lastEventID", lastEventId, "total records", len(eventRecords), "fetch time", fetchTime, "process time", processTime)
-
-	return lastEventId, nil
+	return lastEventId, len(eventRecords), time.Since(fetchStart), nil
 }
 
 func fetchAndWriteSpans(
 	ctx context.Context,
 	blockNum uint64,
 	tx kv.RwTx,
-	heimdallClient bor.IHeimdallClient,
+	heimdallClient heimdall.IHeimdallClient,
 	logPrefix string,
 	logger log.Logger,
-) error {
-	var spanID uint64
+) (uint64, error) {
+	var spanId uint64
 	if blockNum > zerothSpanEnd {
-		spanID = 1 + (blockNum-zerothSpanEnd-1)/spanLength
+		spanId = 1 + (blockNum-zerothSpanEnd-1)/spanLength
 	}
-	logger.Info(fmt.Sprintf("[%s] Fetching span", logPrefix), "id", spanID)
-	response, err := heimdallClient.Span(ctx, spanID)
+	logger.Debug(fmt.Sprintf("[%s] Fetching span", logPrefix), "id", spanId)
+	response, err := heimdallClient.Span(ctx, spanId)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	spanBytes, err := json.Marshal(response)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var spanIDBytes [8]byte
-	binary.BigEndian.PutUint64(spanIDBytes[:], spanID)
+	binary.BigEndian.PutUint64(spanIDBytes[:], spanId)
 	if err = tx.Put(kv.BorSpans, spanIDBytes[:], spanBytes); err != nil {
-		return err
+		return 0, err
 	}
-	return nil
+	return spanId, nil
 }
 
 func BorHeimdallUnwind(u *UnwindState, ctx context.Context, s *StageState, tx kv.RwTx, cfg BorHeimdallCfg) (err error) {

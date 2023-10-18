@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/log/v3"
 	"github.com/urfave/cli/v2"
 
@@ -169,7 +170,7 @@ func doDiff(cliCtx *cli.Context) error {
 }
 
 func doDecompressSpeed(cliCtx *cli.Context) error {
-	logger, err := debug.Setup(cliCtx, true /* rootLogger */)
+	logger, _, err := debug.Setup(cliCtx, true /* rootLogger */)
 	if err != nil {
 		return err
 	}
@@ -210,7 +211,7 @@ func doDecompressSpeed(cliCtx *cli.Context) error {
 func doRam(cliCtx *cli.Context) error {
 	var logger log.Logger
 	var err error
-	if logger, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
+	if logger, _, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
 		return err
 	}
 	defer logger.Info("Done")
@@ -220,8 +221,7 @@ func doRam(cliCtx *cli.Context) error {
 	}
 	f := args.First()
 	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	runtime.ReadMemStats(&m)
+	dbg.ReadMemStats(&m)
 	before := m.Alloc
 	logger.Info("RAM before open", "alloc", common.ByteCount(m.Alloc), "sys", common.ByteCount(m.Sys))
 	decompressor, err := compress.NewDecompressor(f)
@@ -229,13 +229,13 @@ func doRam(cliCtx *cli.Context) error {
 		return err
 	}
 	defer decompressor.Close()
-	runtime.ReadMemStats(&m)
+	dbg.ReadMemStats(&m)
 	logger.Info("RAM after open", "alloc", common.ByteCount(m.Alloc), "sys", common.ByteCount(m.Sys), "diff", common.ByteCount(m.Alloc-before))
 	return nil
 }
 
 func doIndicesCommand(cliCtx *cli.Context) error {
-	logger, err := debug.Setup(cliCtx, true /* rootLogger */)
+	logger, _, err := debug.Setup(cliCtx, true /* rootLogger */)
 	if err != nil {
 		return err
 	}
@@ -285,7 +285,7 @@ func doIndicesCommand(cliCtx *cli.Context) error {
 func doUncompress(cliCtx *cli.Context) error {
 	var logger log.Logger
 	var err error
-	if logger, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
+	if logger, _, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
 		return err
 	}
 	ctx := cliCtx.Context
@@ -338,7 +338,7 @@ func doUncompress(cliCtx *cli.Context) error {
 func doCompress(cliCtx *cli.Context) error {
 	var err error
 	var logger log.Logger
-	if logger, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
+	if logger, _, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
 		return err
 	}
 	ctx := cliCtx.Context
@@ -388,7 +388,7 @@ func doCompress(cliCtx *cli.Context) error {
 func doRetireCommand(cliCtx *cli.Context) error {
 	var logger log.Logger
 	var err error
-	if logger, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
+	if logger, _, err = debug.Setup(cliCtx, true /* rootLogger */); err != nil {
 		return err
 	}
 	defer logger.Info("Done")
@@ -402,11 +402,12 @@ func doRetireCommand(cliCtx *cli.Context) error {
 	defer db.Close()
 
 	cfg := ethconfig.NewSnapCfg(true, true, true)
-	snapshots := freezeblocks.NewRoSnapshots(cfg, dirs.Snap, logger)
-	if err := snapshots.ReopenFolder(); err != nil {
+	blockSnapshots := freezeblocks.NewRoSnapshots(cfg, dirs.Snap, logger)
+	borSnapshots := freezeblocks.NewBorRoSnapshots(cfg, dirs.Snap, logger)
+	if err := blockSnapshots.ReopenFolder(); err != nil {
 		return err
 	}
-	blockReader := freezeblocks.NewBlockReader(snapshots, nil /* borSnapshots */)
+	blockReader := freezeblocks.NewBlockReader(blockSnapshots, borSnapshots)
 	blockWriter := blockio.NewBlockWriter(fromdb.HistV3(db))
 
 	br := freezeblocks.NewBlockRetire(estimate.CompressSnapshot.Workers(), dirs, blockReader, blockWriter, db, nil, logger)
@@ -470,7 +471,7 @@ func doRetireCommand(cliCtx *cli.Context) error {
 		}
 	}
 
-	logger.Info("Work on state history snapshots")
+	logger.Info("Work on state history blockSnapshots")
 	indexWorkers := estimate.IndexSnapshot.Workers()
 	if err = agg.BuildMissedIndices(ctx, indexWorkers); err != nil {
 		return err
@@ -489,7 +490,7 @@ func doRetireCommand(cliCtx *cli.Context) error {
 		return err
 	}
 
-	logger.Info("Build state history snapshots")
+	logger.Info("Build state history blockSnapshots")
 	if err = agg.BuildFiles(lastTxNum); err != nil {
 		return err
 	}
@@ -498,7 +499,7 @@ func doRetireCommand(cliCtx *cli.Context) error {
 		return err
 	}
 	if err := db.UpdateNosync(ctx, func(tx kv.RwTx) error {
-		return rawdb.WriteSnapshots(tx, snapshots.Files(), agg.Files())
+		return rawdb.WriteSnapshots(tx, blockSnapshots.Files(), agg.Files())
 	}); err != nil {
 		return err
 	}
@@ -517,7 +518,7 @@ func doRetireCommand(cliCtx *cli.Context) error {
 	}
 	logger.Info("Prune state history")
 	if err := db.Update(ctx, func(tx kv.RwTx) error {
-		return rawdb.WriteSnapshots(tx, snapshots.Files(), agg.Files())
+		return rawdb.WriteSnapshots(tx, blockSnapshots.Files(), agg.Files())
 	}); err != nil {
 		return err
 	}

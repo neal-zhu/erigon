@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
-	"github.com/ledgerwatch/erigon/consensus/bor"
 	"github.com/ledgerwatch/erigon/consensus/bor/heimdall"
 	"github.com/ledgerwatch/erigon/consensus/bor/heimdallgrpc"
 	"github.com/ledgerwatch/erigon/core/rawdb/blockio"
@@ -315,7 +314,7 @@ var cmdPrintStages = &cobra.Command{
 	Short: "",
 	Run: func(cmd *cobra.Command, args []string) {
 		logger := debug.SetupCobra(cmd, "integration")
-		db, err := openDB(dbCfg(kv.ChainDB, chaindata).Readonly(), false, logger)
+		db, err := openDB(dbCfg(kv.ChainDB, chaindata), false, logger)
 		if err != nil {
 			logger.Error("Opening DB", "error", err)
 			return
@@ -478,6 +477,7 @@ func init() {
 	rootCmd.AddCommand(cmdStageSnapshots)
 
 	withConfig(cmdStageHeaders)
+	withIntegrityChecks(cmdStageHeaders)
 	withDataDir(cmdStageHeaders)
 	withUnwind(cmdStageHeaders)
 	withReset(cmdStageHeaders)
@@ -635,6 +635,11 @@ func stageSnapshots(db kv.RwDB, ctx context.Context, logger log.Logger) error {
 }
 
 func stageHeaders(db kv.RwDB, ctx context.Context, logger log.Logger) error {
+	dirs := datadir.New(datadirCli)
+	if err := datadir.ApplyMigrations(dirs); err != nil {
+		return err
+	}
+
 	sn, borSn, agg := allSnapshots(ctx, db, logger)
 	defer sn.Close()
 	defer borSn.Close()
@@ -643,11 +648,23 @@ func stageHeaders(db kv.RwDB, ctx context.Context, logger log.Logger) error {
 	engine, _, _, _, _ := newSync(ctx, db, nil /* miningConfig */, logger)
 	chainConfig, _, _ := fromdb.ChainConfig(db), kvcfg.HistoryV3.FromDB(db), fromdb.PruneMode(db)
 
-	return db.Update(ctx, func(tx kv.RwTx) error {
-		if !(unwind > 0 || reset) {
-			logger.Info("This command only works with --unwind or --reset options")
+	if integritySlow {
+		if err := db.View(ctx, func(tx kv.Tx) error {
+			log.Info("[integrity] no gaps in canonical headers")
+			integrity.NoGapsInCanonicalHeaders(tx, ctx, br)
+			return nil
+		}); err != nil {
+			return err
 		}
+		return nil
+	}
 
+	if !(unwind > 0 || reset) {
+		logger.Error("This command only works with --unwind or --reset options")
+		return nil
+	}
+
+	return db.Update(ctx, func(tx kv.RwTx) error {
 		if reset {
 			dirs := datadir.New(datadirCli)
 			if err := reset2.ResetBlocks(tx, db, agg, br, bw, dirs, *chainConfig, engine, logger); err != nil {
@@ -853,6 +870,10 @@ func stageSenders(db kv.RwDB, ctx context.Context, logger log.Logger) error {
 
 func stageExec(db kv.RwDB, ctx context.Context, logger log.Logger) error {
 	dirs := datadir.New(datadirCli)
+	if err := datadir.ApplyMigrations(dirs); err != nil {
+		return err
+	}
+
 	engine, vmConfig, sync, _, _ := newSync(ctx, db, nil /* miningConfig */, logger)
 	must(sync.SetCurrentStage(stages.Execution))
 	sn, borSn, agg := allSnapshots(ctx, db, logger)
@@ -895,7 +916,7 @@ func stageExec(db kv.RwDB, ctx context.Context, logger log.Logger) error {
 	br, _ := blocksIO(db, logger)
 	cfg := stagedsync.StageExecuteBlocksCfg(db, pm, batchSize, nil, chainConfig, engine, vmConfig, nil,
 		/*stateStream=*/ false,
-		/*badBlockHalt=*/ false, historyV3, dirs, br, nil, genesis, syncCfg, agg)
+		/*badBlockHalt=*/ false, historyV3, dirs, br, nil, genesis, syncCfg, agg, nil)
 
 	var tx kv.RwTx //nil - means lower-level code (each stage) will manage transactions
 	if noCommit {
@@ -1467,7 +1488,7 @@ func newDomains(ctx context.Context, db kv.RwDB, stepSize uint64, mode libstate.
 	cfg.Snapshot = allSn.Cfg()
 
 	blockReader, _ := blocksIO(db, logger)
-	engine, _ := initConsensusEngine(chainConfig, cfg.Dirs.DataDir, db, blockReader, logger)
+	engine, _ := initConsensusEngine(ctx, chainConfig, cfg.Dirs.DataDir, db, blockReader, logger)
 	return engine, cfg, allSn, agg
 }
 
@@ -1504,7 +1525,7 @@ func newSync(ctx context.Context, db kv.RwDB, miningConfig *params.MiningConfig,
 	cfg.Snapshot = allSn.Cfg()
 
 	blockReader, blockWriter := blocksIO(db, logger)
-	engine, heimdallClient := initConsensusEngine(chainConfig, cfg.Dirs.DataDir, db, blockReader, logger)
+	engine, heimdallClient := initConsensusEngine(ctx, chainConfig, cfg.Dirs.DataDir, db, blockReader, logger)
 
 	maxBlockBroadcastPeers := func(header *types.Header) uint { return 0 }
 
@@ -1532,7 +1553,7 @@ func newSync(ctx context.Context, db kv.RwDB, miningConfig *params.MiningConfig,
 	notifications := &shards.Notifications{}
 	blockRetire := freezeblocks.NewBlockRetire(1, dirs, blockReader, blockWriter, db, notifications.Events, logger)
 
-	stages := stages2.NewDefaultStages(context.Background(), db, p2p.Config{}, &cfg, sentryControlServer, notifications, nil, blockReader, blockRetire, agg, nil, heimdallClient, logger)
+	stages := stages2.NewDefaultStages(context.Background(), db, p2p.Config{}, &cfg, sentryControlServer, notifications, nil, blockReader, blockRetire, agg, nil, nil, heimdallClient, logger)
 	sync := stagedsync.New(stages, stagedsync.DefaultUnwindOrder, stagedsync.DefaultPruneOrder, logger)
 
 	miner := stagedsync.NewMiningState(&cfg.Miner)
@@ -1545,7 +1566,7 @@ func newSync(ctx context.Context, db kv.RwDB, miningConfig *params.MiningConfig,
 	miningSync := stagedsync.New(
 		stagedsync.MiningStages(ctx,
 			stagedsync.StageMiningCreateBlockCfg(db, miner, *chainConfig, engine, nil, nil, dirs.Tmp, blockReader),
-			stagedsync.StageBorHeimdallCfg(db, miner, *chainConfig, heimdallClient, blockReader),
+			stagedsync.StageBorHeimdallCfg(db, miner, *chainConfig, heimdallClient, blockReader, nil, nil),
 			stagedsync.StageMiningExecCfg(db, miner, events, *chainConfig, engine, &vm.Config{}, dirs.Tmp, nil, 0, nil, nil, blockReader),
 			stagedsync.StageHashStateCfg(db, dirs, historyV3),
 			stagedsync.StageTrieCfg(db, false, true, false, dirs.Tmp, blockReader, nil, historyV3, agg),
@@ -1595,7 +1616,7 @@ func overrideStorageMode(db kv.RwDB, logger log.Logger) error {
 	})
 }
 
-func initConsensusEngine(cc *chain2.Config, dir string, db kv.RwDB, blockReader services.FullBlockReader, logger log.Logger) (engine consensus.Engine, heimdallClient bor.IHeimdallClient) {
+func initConsensusEngine(ctx context.Context, cc *chain2.Config, dir string, db kv.RwDB, blockReader services.FullBlockReader, logger log.Logger) (engine consensus.Engine, heimdallClient heimdall.IHeimdallClient) {
 	config := ethconfig.Defaults
 
 	var consensusConfig interface{}
@@ -1616,6 +1637,6 @@ func initConsensusEngine(cc *chain2.Config, dir string, db kv.RwDB, blockReader 
 	} else {
 		consensusConfig = &config.Ethash
 	}
-	return ethconsensusconfig.CreateConsensusEngine(&nodecfg.Config{Dirs: datadir.New(dir)}, cc, consensusConfig, config.Miner.Notify, config.Miner.Noverify,
+	return ethconsensusconfig.CreateConsensusEngine(ctx, &nodecfg.Config{Dirs: datadir.New(dir)}, cc, consensusConfig, config.Miner.Notify, config.Miner.Noverify,
 		heimdallClient, config.WithoutHeimdall, blockReader, db.ReadOnly(), logger), heimdallClient
 }

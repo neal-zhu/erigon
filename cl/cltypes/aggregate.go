@@ -21,6 +21,10 @@ func (a *AggregateAndProof) EncodeSSZ(dst []byte) ([]byte, error) {
 	return ssz2.MarshalSSZ(dst, a.AggregatorIndex, a.Aggregate, a.SelectionProof[:])
 }
 
+func (a *AggregateAndProof) Static() bool {
+	return false
+}
+
 func (a *AggregateAndProof) DecodeSSZ(buf []byte, version int) error {
 	a.Aggregate = new(solid.Attestation)
 	return ssz2.UnmarshalSSZ(buf, version, &a.AggregatorIndex, a.Aggregate, a.SelectionProof[:])
@@ -52,13 +56,17 @@ func (a *SignedAggregateAndProof) EncodingSizeSSZ() int {
 	return 100 + a.Message.EncodingSizeSSZ()
 }
 
+func (a *SignedAggregateAndProof) HashSSZ() ([32]byte, error) {
+	return merkle_tree.HashTreeRoot(a.Message, a.Signature[:])
+}
+
 /*
  * SyncAggregate, Determines successfull committee, bits shows active participants,
  * and signature is the aggregate BLS signature of the committee.
  */
 type SyncAggregate struct {
-	SyncCommiteeBits      [64]byte
-	SyncCommiteeSignature [96]byte
+	SyncCommiteeBits      libcommon.Bytes64 `json:"sync_commitee_bits"`
+	SyncCommiteeSignature libcommon.Bytes96 `json:"signature"`
 }
 
 // return sum of the committee bits

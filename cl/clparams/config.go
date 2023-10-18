@@ -21,12 +21,12 @@ import (
 	"os"
 	"time"
 
+	"github.com/ledgerwatch/erigon-lib/chain/networkname"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/types/ssz"
 	"gopkg.in/yaml.v2"
 
 	"github.com/ledgerwatch/erigon/cl/utils"
-	"github.com/ledgerwatch/erigon/params/networkname"
 )
 
 type NetworkType int
@@ -925,6 +925,22 @@ func (b *BeaconChainConfig) CurrentEpochAttestationsLength() uint64 {
 	return b.SlotsPerEpoch * b.MaxAttestations
 }
 
+func (b *BeaconChainConfig) GetForkVersionByVersion(v StateVersion) uint32 {
+	switch v {
+	case Phase0Version:
+		return b.GenesisForkVersion
+	case AltairVersion:
+		return b.AltairForkVersion
+	case BellatrixVersion:
+		return b.BellatrixForkVersion
+	case CapellaVersion:
+		return b.CapellaForkVersion
+	case DenebVersion:
+		return b.DenebForkVersion
+	}
+	panic("invalid version")
+}
+
 func GetConfigsByNetwork(net NetworkType) (*GenesisConfig, *NetworkConfig, *BeaconChainConfig) {
 	networkConfig := NetworkConfigs[net]
 	genesisConfig := GenesisConfigs[net]
@@ -953,6 +969,7 @@ func GetConfigsByNetworkName(net string) (*GenesisConfig, *NetworkConfig, *Beaco
 		return nil, nil, nil, MainnetNetwork, fmt.Errorf("chain not found")
 	}
 }
+
 func GetCheckpointSyncEndpoint(net NetworkType) string {
 	checkpoints, ok := CheckpointSyncEndpoints[net]
 	if !ok {

@@ -3,10 +3,11 @@ package bor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"sort"
 	"strconv"
@@ -16,7 +17,11 @@ import (
 
 	"github.com/google/btree"
 	lru "github.com/hashicorp/golang-lru/arc/v2"
+	"github.com/ledgerwatch/erigon/eth/ethconfig/estimate"
 	"github.com/ledgerwatch/log/v3"
+	"github.com/xsleonard/go-merkle"
+	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ledgerwatch/erigon-lib/chain"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
@@ -25,12 +30,16 @@ import (
 
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality/flags"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality/whitelist"
+	"github.com/ledgerwatch/erigon/consensus/bor/heimdall"
 	"github.com/ledgerwatch/erigon/consensus/bor/heimdall/span"
 	"github.com/ledgerwatch/erigon/consensus/bor/statefull"
 	"github.com/ledgerwatch/erigon/consensus/bor/valset"
 	"github.com/ledgerwatch/erigon/consensus/misc"
+	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/state"
-	"github.com/ledgerwatch/erigon/core/systemcontracts"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/crypto"
@@ -67,6 +76,9 @@ var (
 	// diffNoTurn = big.NewInt(1) // Block difficulty for out-of-turn signatures
 
 	validatorHeaderBytesLength = length.Addr + 20 // address + power
+
+	// MaxCheckpointLength is the maximum number of blocks that can be requested for constructing a checkpoint root hash
+	MaxCheckpointLength = uint64(math.Pow(2, 15))
 )
 
 // Various error messages to mark blocks invalid. These should be private to
@@ -125,6 +137,8 @@ var (
 
 	errUncleDetected     = errors.New("uncles not allowed")
 	errUnknownValidators = errors.New("unknown validators")
+
+	errUnknownSnapshot = errors.New("unknown snapshot")
 )
 
 // SignerFn is a signer callback function to request a header to be signed by a
@@ -245,15 +259,19 @@ type Bor struct {
 
 	spanner                Spanner
 	GenesisContractsClient GenesisContract
-	HeimdallClient         IHeimdallClient
+	HeimdallClient         heimdall.IHeimdallClient
 
 	// scope event.SubscriptionScope
 	// The fields below are for testing only
 	fakeDiff  bool // Skip difficulty verifications
 	spanCache *btree.BTree
 
-	closeOnce sync.Once
-	logger    log.Logger
+	closeOnce           sync.Once
+	logger              log.Logger
+	closeCh             chan struct{} // Channel to signal the background processes to exit
+	frozenSnapshotsInit sync.Once
+	rootHashCache       *lru.ARCCache[string, string]
+	headerProgress      HeaderProgress
 }
 
 type signer struct {
@@ -356,7 +374,7 @@ func New(
 	db kv.RwDB,
 	blockReader services.FullBlockReader,
 	spanner Spanner,
-	heimdallClient IHeimdallClient,
+	heimdallClient heimdall.IHeimdallClient,
 	genesisContracts GenesisContract,
 	logger log.Logger,
 ) *Bor {
@@ -371,6 +389,7 @@ func New(
 	// Allocate the snapshot caches and create the engine
 	recents, _ := lru.NewARC[libcommon.Hash, *Snapshot](inmemorySnapshots)
 	signatures, _ := lru.NewARC[libcommon.Hash, libcommon.Address](inmemorySignatures)
+
 	c := &Bor{
 		chainConfig:            chainConfig,
 		config:                 borConfig,
@@ -384,6 +403,7 @@ func New(
 		spanCache:              btree.New(32),
 		execCtx:                context.Background(),
 		logger:                 logger,
+		closeCh:                make(chan struct{}),
 	}
 
 	c.authorizedSigner.Store(&signer{
@@ -396,7 +416,7 @@ func New(
 
 	// make sure we can decode all the GenesisAlloc in the BorConfig.
 	for key, genesisAlloc := range c.config.BlockAlloc {
-		if _, err := decodeGenesisAlloc(genesisAlloc); err != nil {
+		if _, err := types.DecodeGenesisAlloc(genesisAlloc); err != nil {
 			panic(fmt.Sprintf("BUG: Block alloc '%s' in genesis is not correct: %v", key, err))
 		}
 	}
@@ -404,9 +424,65 @@ func New(
 	return c
 }
 
+type rwWrapper struct {
+	kv.RoDB
+}
+
+func (w rwWrapper) Update(ctx context.Context, f func(tx kv.RwTx) error) error {
+	return fmt.Errorf("Update not implemented")
+}
+
+func (w rwWrapper) UpdateNosync(ctx context.Context, f func(tx kv.RwTx) error) error {
+	return fmt.Errorf("UpdateNosync not implemented")
+}
+
+func (w rwWrapper) BeginRw(ctx context.Context) (kv.RwTx, error) {
+	return nil, fmt.Errorf("BeginRw not implemented")
+}
+
+func (w rwWrapper) BeginRwNosync(ctx context.Context) (kv.RwTx, error) {
+	return nil, fmt.Errorf("BeginRwNosync not implemented")
+}
+
+// This is used by the rpcdaemon which needs read only access to the provided data services
+func NewRo(chainConfig *chain.Config, db kv.RoDB, blockReader services.FullBlockReader, spanner Spanner,
+	genesisContracts GenesisContract, logger log.Logger) *Bor {
+	// get bor config
+	borConfig := chainConfig.Bor
+
+	// Set any missing consensus parameters to their defaults
+	if borConfig != nil && borConfig.CalculateSprint(0) == 0 {
+		borConfig.Sprint = defaultSprintLength
+	}
+
+	recents, _ := lru.NewARC[libcommon.Hash, *Snapshot](inmemorySnapshots)
+	signatures, _ := lru.NewARC[libcommon.Hash, libcommon.Address](inmemorySignatures)
+
+	return &Bor{
+		chainConfig: chainConfig,
+		config:      borConfig,
+		DB:          rwWrapper{db},
+		blockReader: blockReader,
+		logger:      logger,
+		recents:     recents,
+		signatures:  signatures,
+		spanCache:   btree.New(32),
+		execCtx:     context.Background(),
+		closeCh:     make(chan struct{}),
+	}
+}
+
 // Type returns underlying consensus engine
 func (c *Bor) Type() chain.ConsensusName {
 	return chain.BorConsensus
+}
+
+type HeaderProgress interface {
+	Progress() uint64
+}
+
+func (c *Bor) HeaderProgress(p HeaderProgress) {
+	c.headerProgress = p
 }
 
 // Author implements consensus.Engine, returning the Ethereum address recovered
@@ -419,7 +495,6 @@ func (c *Bor) Author(header *types.Header) (libcommon.Address, error) {
 
 // VerifyHeader checks whether a header conforms to the consensus rules.
 func (c *Bor) VerifyHeader(chain consensus.ChainHeaderReader, header *types.Header, seal bool) error {
-
 	return c.verifyHeader(chain, header, nil)
 }
 
@@ -461,7 +536,7 @@ func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Head
 		return consensus.ErrFutureBlock
 	}
 
-	if err := validateHeaderExtraField(header.Extra); err != nil {
+	if err := ValidateHeaderExtraField(header.Extra); err != nil {
 		return err
 	}
 
@@ -506,9 +581,9 @@ func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Head
 	return c.verifyCascadingFields(chain, header, parents)
 }
 
-// validateHeaderExtraField validates that the extra-data contains both the vanity and signature.
+// ValidateHeaderExtraField validates that the extra-data contains both the vanity and signature.
 // header.Extra = header.Vanity + header.ProducerBytes (optional) + header.Seal
-func validateHeaderExtraField(extraBytes []byte) error {
+func ValidateHeaderExtraField(extraBytes []byte) error {
 	if len(extraBytes) < extraVanity {
 		return errMissingVanity
 	}
@@ -623,7 +698,7 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 		for i, validator := range currentValidators {
 			copy(validatorsBytes[i*validatorHeaderBytesLength:], validator.HeaderBytes())
 		}
-		// len(header.Extra) >= extraVanity+extraSeal has already been validated in validateHeaderExtraField, so this won't result in a panic
+		// len(header.Extra) >= extraVanity+extraSeal has already been validated in ValidateHeaderExtraField, so this won't result in a panic
 		if !bytes.Equal(parentValidatorBytes, validatorsBytes) {
 			return &MismatchingValidatorsError{number - 1, validatorsBytes, parentValidatorBytes}
 		}
@@ -631,6 +706,81 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 
 	// All basic checks passed, verify the seal and return
 	return c.verifySeal(chain, header, parents, snap)
+}
+
+func (c *Bor) initFrozenSnapshot(chain consensus.ChainHeaderReader, number uint64, logEvery *time.Ticker) (snap *Snapshot, err error) {
+	c.logger.Info("Initializing frozen snapshots to", "number", number)
+	defer func() {
+		c.logger.Info("Done initializing frozen snapshots to", "number", number, "err", err)
+	}()
+
+	// Special handling of the headers in the snapshot
+	zeroHeader := chain.GetHeaderByNumber(0)
+
+	if zeroHeader != nil {
+		// get checkpoint data
+		hash := zeroHeader.Hash()
+
+		// get validators and current span
+		var validators []*valset.Validator
+
+		validators, err = c.spanner.GetCurrentValidators(1, c.authorizedSigner.Load().signer, c.getSpanForBlock)
+
+		if err != nil {
+			return nil, err
+		}
+
+		// new snap shot
+		snap = newSnapshot(c.config, c.signatures, 0, hash, validators, c.logger)
+
+		if err = snap.store(c.DB); err != nil {
+			return nil, err
+		}
+
+		c.logger.Info("Stored proposer snapshot to disk", "number", 0, "hash", hash)
+
+		g := errgroup.Group{}
+		g.SetLimit(estimate.AlmostAllCPUs())
+		defer g.Wait()
+
+		batchSize := 128 // must be < inmemorySignatures
+		initialHeaders := make([]*types.Header, 0, batchSize)
+
+		for i := uint64(1); i <= number; i++ {
+			header := chain.GetHeaderByNumber(i)
+			{
+				// `snap.apply` bottleneck - is recover of signer.
+				// to speedup: recover signer in background goroutines and save in `sigcache`
+				// `batchSize` < `inmemorySignatures`: means all current batch will fit in cache - and `snap.apply` will find it there.
+				snap := snap
+				g.Go(func() error {
+					_, _ = ecrecover(header, snap.sigcache, snap.config)
+					return nil
+				})
+			}
+			initialHeaders = append(initialHeaders, header)
+			if len(initialHeaders) == cap(initialHeaders) {
+				snap, err = snap.apply(initialHeaders, c.logger)
+
+				if err != nil {
+					return nil, err
+				}
+
+				initialHeaders = initialHeaders[:0]
+			}
+			select {
+			case <-logEvery.C:
+				log.Info("Computing validator proposer prorities (forward)", "blockNum", i)
+			default:
+			}
+		}
+
+		if snap, err = snap.apply(initialHeaders, c.logger); err != nil {
+			return nil, err
+		}
+	}
+
+	return snap, nil
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
@@ -647,7 +797,6 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash li
 		// If an in-memory snapshot was found, use that
 		if s, ok := c.recents.Get(hash); ok {
 			snap = s
-
 			break
 		}
 
@@ -657,7 +806,6 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash li
 				c.logger.Trace("Loaded snapshot from disk", "number", number, "hash", hash)
 
 				snap = s
-
 				break
 			}
 		}
@@ -674,9 +822,11 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash li
 			parents = parents[:len(parents)-1]
 		} else {
 			// No explicit parents (or no more left), reach out to the database
-			if chain != nil {
-				header = chain.GetHeader(hash, number)
+			if chain == nil {
+				break
 			}
+
+			header = chain.GetHeader(hash, number)
 
 			if header == nil {
 				return nil, consensus.ErrUnknownAncestor
@@ -700,50 +850,22 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash li
 		default:
 		}
 	}
+
 	if snap == nil && chain != nil && number <= chain.FrozenBlocks() {
-		// Special handling of the headers in the snapshot
-		zeroHeader := chain.GetHeaderByNumber(0)
-		if zeroHeader != nil {
-			// get checkpoint data
-			hash := zeroHeader.Hash()
+		var err error
 
-			// get validators and current span
-			validators, err := c.spanner.GetCurrentValidators(1, c.authorizedSigner.Load().signer, c.getSpanForBlock)
-			if err != nil {
-				return nil, err
-			}
+		c.frozenSnapshotsInit.Do(func() {
+			snap, err = c.initFrozenSnapshot(chain, number, logEvery)
+		})
 
-			// new snap shot
-			snap = newSnapshot(c.config, c.signatures, 0, hash, validators, c.logger)
-			if err := snap.store(c.DB); err != nil {
-				return nil, err
-			}
-			c.logger.Info("Stored proposer snapshot to disk", "number", 0, "hash", hash)
-			initialHeaders := make([]*types.Header, 0, 128)
-			for i := uint64(1); i <= number; i++ {
-				header := chain.GetHeaderByNumber(i)
-				initialHeaders = append(initialHeaders, header)
-				if len(initialHeaders) == cap(initialHeaders) {
-					if snap, err = snap.apply(initialHeaders, c.logger); err != nil {
-						return nil, err
-					}
-					initialHeaders = initialHeaders[:0]
-				}
-				select {
-				case <-logEvery.C:
-					log.Info("Computing validator proposer prorities (forward)", "blockNum", i)
-				default:
-				}
-			}
-			if snap, err = snap.apply(initialHeaders, c.logger); err != nil {
-				return nil, err
-			}
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	// check if snapshot is nil
 	if snap == nil {
-		return nil, fmt.Errorf("unknown error while retrieving snapshot at block number %v", number)
+		return nil, fmt.Errorf("%w at block number %v", errUnknownSnapshot, number)
 	}
 
 	// Previous snapshot found, apply any pending headers on top of it
@@ -764,7 +886,7 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash li
 			return nil, err
 		}
 
-		c.logger.Info("Stored proposer snapshot to disk", "number", snap.Number, "hash", snap.Hash)
+		c.logger.Trace("Stored proposer snapshot to disk", "number", snap.Number, "hash", snap.Hash)
 	}
 
 	return snap, err
@@ -961,25 +1083,10 @@ func (c *Bor) Finalize(config *chain.Config, header *types.Header, state *state.
 	return nil, types.Receipts{}, nil
 }
 
-func decodeGenesisAlloc(i interface{}) (types.GenesisAlloc, error) {
-	var alloc types.GenesisAlloc
-
-	b, err := json.Marshal(i)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := json.Unmarshal(b, &alloc); err != nil {
-		return nil, err
-	}
-
-	return alloc, nil
-}
-
 func (c *Bor) changeContractCodeIfNeeded(headerNumber uint64, state *state.IntraBlockState) error {
 	for blockNumber, genesisAlloc := range c.config.BlockAlloc {
 		if blockNumber == strconv.FormatUint(headerNumber, 10) {
-			allocs, err := decodeGenesisAlloc(genesisAlloc)
+			allocs, err := types.DecodeGenesisAlloc(genesisAlloc)
 			if err != nil {
 				return fmt.Errorf("failed to decode genesis alloc: %v", err)
 			}
@@ -1048,7 +1155,6 @@ func (c *Bor) GenerateSeal(chain consensus.ChainHeaderReader, currnt, parent *ty
 
 func (c *Bor) Initialize(config *chain.Config, chain consensus.ChainHeaderReader, header *types.Header,
 	state *state.IntraBlockState, syscall consensus.SysCallCustom, logger log.Logger) {
-	systemcontracts.UpgradeBuildInSystemContract(config, header.Number, state, logger)
 }
 
 // Authorize injects a private key into the consensus engine to mint new blocks
@@ -1098,9 +1204,15 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	}
 
 	// Sweet, the protocol permits us to sign the block, wait for our time
-	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
+	delay := time.Until(time.Unix(int64(header.Time), 0))
 	// wiggle was already accounted for in header.Time, this is just for logging
 	wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
+
+	// temp for testing
+	if wiggle > 0 {
+		wiggle = 500 * time.Millisecond
+	}
+	// temp for testing
 
 	// Sign all the things!
 	sighash, err := signFn(signer, accounts.MimetypeBor, BorRLP(header, c.config))
@@ -1109,15 +1221,21 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	}
 	copy(header.Extra[len(header.Extra)-extraSeal:], sighash)
 
-	// Wait until sealing is terminated or delay timeout.
-	c.logger.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay", common.PrettyDuration(delay), "TxCount", block.Transactions().Len(), "Signer", signer)
-
 	go func() {
+		// Wait until sealing is terminated or delay timeout.
+		c.logger.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay", common.PrettyDuration(delay), "TxCount", block.Transactions().Len(), "Signer", signer)
+
 		select {
 		case <-stop:
-			c.logger.Info("Discarding sealing operation for block", "number", number)
+			c.logger.Info("Stopped sealing operation for block", "number", number)
 			return
 		case <-time.After(delay):
+
+			if c.headerProgress != nil && c.headerProgress.Progress() >= number {
+				c.logger.Info("Discarding sealing operation for block", "number", number)
+				return
+			}
+
 			if wiggle > 0 {
 				c.logger.Info(
 					"Sealed out-of-turn",
@@ -1155,7 +1273,12 @@ func (c *Bor) IsValidator(header *types.Header) (bool, error) {
 	}
 
 	snap, err := c.snapshot(nil, number-1, header.ParentHash, nil)
+
 	if err != nil {
+		if errors.Is(err, errUnknownSnapshot) {
+			return false, nil
+		}
+
 		return false, err
 	}
 
@@ -1209,23 +1332,49 @@ func (c *Bor) IsServiceTransaction(sender libcommon.Address, syscall consensus.S
 	return false
 }
 
-// APIs implements consensus.Engine, returning the user facing RPC API to allow
-// controlling the signer voting.
+// Depricated: To get the API use jsonrpc.APIList
 func (c *Bor) APIs(chain consensus.ChainHeaderReader) []rpc.API {
-	return []rpc.API{{
-		Namespace: "bor",
-		Version:   "1.0",
-		Service:   &API{chain: chain, bor: c},
-		Public:    false,
-	}}
+	return []rpc.API{}
 }
 
-// Close implements consensus.Engine. It's a noop for bor as there are no background threads.
+type FinalityAPI interface {
+	GetRootHash(start uint64, end uint64) (string, error)
+}
+
+type FinalityAPIFunc func(start uint64, end uint64) (string, error)
+
+func (f FinalityAPIFunc) GetRootHash(start uint64, end uint64) (string, error) {
+	return f(start, end)
+}
+
+func (c *Bor) Start(chainDB kv.RwDB) {
+	if flags.Milestone {
+		whitelist.RegisterService(c.DB)
+		finality.Whitelist(c.HeimdallClient, c.DB, chainDB, c.blockReader, c.logger,
+			FinalityAPIFunc(func(start uint64, end uint64) (string, error) {
+				ctx := context.Background()
+				tx, err := chainDB.BeginRo(ctx)
+				if err != nil {
+					return "", err
+				}
+				defer tx.Rollback()
+
+				return c.GetRootHash(ctx, tx, start, end)
+			}), c.closeCh)
+	}
+}
+
 func (c *Bor) Close() error {
 	c.closeOnce.Do(func() {
+		if c.DB != nil {
+			c.DB.Close()
+		}
+
 		if c.HeimdallClient != nil {
 			c.HeimdallClient.Close()
 		}
+		// Close all bg processes
+		close(c.closeCh)
 	})
 
 	return nil
@@ -1292,7 +1441,11 @@ func (c *Bor) getSpanForBlock(blockNum uint64) (*span.HeimdallSpan, error) {
 		spanID = 1 + (blockNum-zerothSpanEnd-1)/spanLength
 	}
 
-	c.logger.Info("Span with given block number is not loaded", "fetching span", spanID)
+	if c.HeimdallClient == nil {
+		return nil, fmt.Errorf("span with given block number is not loaded: %d", spanID)
+	}
+
+	c.logger.Debug("Span with given block number is not loaded", "fetching span", spanID)
 
 	response, err := c.HeimdallClient.Span(c.execCtx, spanID)
 	if err != nil {
@@ -1346,6 +1499,81 @@ func (c *Bor) fetchAndCommitSpan(
 	return c.spanner.CommitSpan(heimdallSpan, syscall)
 }
 
+func (c *Bor) GetRootHash(ctx context.Context, tx kv.Tx, start, end uint64) (string, error) {
+	length := end - start + 1
+	if length > MaxCheckpointLength {
+		return "", &MaxCheckpointLengthExceededError{Start: start, End: end}
+	}
+
+	cacheKey := strconv.FormatUint(start, 10) + "-" + strconv.FormatUint(end, 10)
+
+	if c.rootHashCache == nil {
+		c.rootHashCache, _ = lru.NewARC[string, string](100)
+	}
+
+	if root, known := c.rootHashCache.Get(cacheKey); known {
+		return root, nil
+	}
+
+	header := rawdb.ReadCurrentHeader(tx)
+	var currentHeaderNumber uint64 = 0
+	if header == nil {
+		return "", &valset.InvalidStartEndBlockError{Start: start, End: end, CurrentHeader: currentHeaderNumber}
+	}
+	currentHeaderNumber = header.Number.Uint64()
+	if start > end || end > currentHeaderNumber {
+		return "", &valset.InvalidStartEndBlockError{Start: start, End: end, CurrentHeader: currentHeaderNumber}
+	}
+	blockHeaders := make([]*types.Header, end-start+1)
+	for number := start; number <= end; number++ {
+		blockHeaders[number-start], _ = c.getHeaderByNumber(ctx, tx, number)
+	}
+
+	headers := make([][32]byte, NextPowerOfTwo(length))
+	for i := 0; i < len(blockHeaders); i++ {
+		blockHeader := blockHeaders[i]
+		header := crypto.Keccak256(AppendBytes32(
+			blockHeader.Number.Bytes(),
+			new(big.Int).SetUint64(blockHeader.Time).Bytes(),
+			blockHeader.TxHash.Bytes(),
+			blockHeader.ReceiptHash.Bytes(),
+		))
+
+		var arr [32]byte
+		copy(arr[:], header)
+		headers[i] = arr
+	}
+	tree := merkle.NewTreeWithOpts(merkle.TreeOptions{EnableHashSorting: false, DisableHashLeaves: true})
+	if err := tree.Generate(Convert(headers), sha3.NewLegacyKeccak256()); err != nil {
+		return "", err
+	}
+	root := hex.EncodeToString(tree.Root().Hash)
+
+	c.rootHashCache.Add(cacheKey, root)
+
+	return root, nil
+}
+
+func (c *Bor) getHeaderByNumber(ctx context.Context, tx kv.Tx, number uint64) (*types.Header, error) {
+	_, err := c.blockReader.BlockByNumber(ctx, tx, number)
+
+	if err != nil {
+		return nil, err
+	}
+
+	header, err := c.blockReader.HeaderByNumber(ctx, tx, number)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if header == nil {
+		return nil, fmt.Errorf("block header not found: %d", number)
+	}
+
+	return header, nil
+}
+
 // CommitStates commit states
 func (c *Bor) CommitStates(
 	state *state.IntraBlockState,
@@ -1362,7 +1590,7 @@ func (c *Bor) CommitStates(
 	return nil
 }
 
-func (c *Bor) SetHeimdallClient(h IHeimdallClient) {
+func (c *Bor) SetHeimdallClient(h heimdall.IHeimdallClient) {
 	c.HeimdallClient = h
 }
 

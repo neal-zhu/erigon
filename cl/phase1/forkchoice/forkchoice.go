@@ -1,6 +1,7 @@
 package forkchoice
 
 import (
+	"context"
 	"sync"
 
 	"github.com/ledgerwatch/erigon/cl/cltypes/solid"
@@ -8,19 +9,22 @@ import (
 	state2 "github.com/ledgerwatch/erigon/cl/phase1/core/state"
 	"github.com/ledgerwatch/erigon/cl/phase1/execution_client"
 	"github.com/ledgerwatch/erigon/cl/phase1/forkchoice/fork_graph"
+	"github.com/ledgerwatch/erigon/cl/pool"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/length"
 )
 
 type checkpointComparable string
 
 const (
 	checkpointsPerCache = 1024
-	allowedCachedStates = 4
+	allowedCachedStates = 8
 )
 
 type ForkChoiceStore struct {
+	ctx                           context.Context
 	time                          uint64
 	highestSeen                   uint64
 	justifiedCheckpoint           solid.Checkpoint
@@ -28,12 +32,15 @@ type ForkChoiceStore struct {
 	unrealizedJustifiedCheckpoint solid.Checkpoint
 	unrealizedFinalizedCheckpoint solid.Checkpoint
 	proposerBoostRoot             libcommon.Hash
+	headHash                      libcommon.Hash
+	headSlot                      uint64
 	// Use go map because this is actually an unordered set
 	equivocatingIndicies map[uint64]struct{}
 	forkGraph            *fork_graph.ForkGraph
 	// I use the cache due to the convenient auto-cleanup feauture.
-	checkpointStates *lru.Cache[checkpointComparable, *checkpointState] // We keep ssz snappy of it as the full beacon state is full of rendundant data.
+	checkpointStates map[checkpointComparable]*checkpointState // We keep ssz snappy of it as the full beacon state is full of rendundant data.
 	latestMessages   map[uint64]*LatestMessage
+	anchorPublicKeys []byte
 	// We keep track of them so that we can forkchoice with EL.
 	eth2Roots *lru.Cache[libcommon.Hash, libcommon.Hash] // ETH2 root -> ETH1 hash
 	mu        sync.Mutex
@@ -41,6 +48,8 @@ type ForkChoiceStore struct {
 	engine execution_client.ExecutionEngine
 	// freezer
 	recorder freezer.Freezer
+	// operations pool
+	operationsPool pool.OperationsPool
 }
 
 type LatestMessage struct {
@@ -49,7 +58,7 @@ type LatestMessage struct {
 }
 
 // NewForkChoiceStore initialize a new store from the given anchor state, either genesis or checkpoint sync state.
-func NewForkChoiceStore(anchorState *state2.CachingBeaconState, engine execution_client.ExecutionEngine, recorder freezer.Freezer, enabledPruning bool) (*ForkChoiceStore, error) {
+func NewForkChoiceStore(ctx context.Context, anchorState *state2.CachingBeaconState, engine execution_client.ExecutionEngine, recorder freezer.Freezer, operationsPool pool.OperationsPool, enabledPruning bool) (*ForkChoiceStore, error) {
 	anchorRoot, err := anchorState.BlockRoot()
 	if err != nil {
 		return nil, err
@@ -58,16 +67,22 @@ func NewForkChoiceStore(anchorState *state2.CachingBeaconState, engine execution
 		anchorRoot,
 		state2.Epoch(anchorState.BeaconState),
 	)
-	checkpointStates, err := lru.New[checkpointComparable, *checkpointState](allowedCachedStates)
-	if err != nil {
-		return nil, err
-	}
+
 	eth2Roots, err := lru.New[libcommon.Hash, libcommon.Hash](checkpointsPerCache)
 	if err != nil {
 		return nil, err
 	}
+	anchorPublicKeys := make([]byte, anchorState.ValidatorLength()*length.Bytes48)
+	for idx := 0; idx < anchorState.ValidatorLength(); idx++ {
+		pk, err := anchorState.ValidatorPublicKey(idx)
+		if err != nil {
+			return nil, err
+		}
+		copy(anchorPublicKeys[idx*length.Bytes48:], pk[:])
+	}
 
 	return &ForkChoiceStore{
+		ctx:                           ctx,
 		highestSeen:                   anchorState.Slot(),
 		time:                          anchorState.GenesisTime() + anchorState.BeaconConfig().SecondsPerSlot*anchorState.Slot(),
 		justifiedCheckpoint:           anchorCheckpoint.Copy(),
@@ -77,10 +92,12 @@ func NewForkChoiceStore(anchorState *state2.CachingBeaconState, engine execution
 		forkGraph:                     fork_graph.New(anchorState, enabledPruning),
 		equivocatingIndicies:          map[uint64]struct{}{},
 		latestMessages:                map[uint64]*LatestMessage{},
-		checkpointStates:              checkpointStates,
+		checkpointStates:              make(map[checkpointComparable]*checkpointState),
 		eth2Roots:                     eth2Roots,
 		engine:                        engine,
 		recorder:                      recorder,
+		operationsPool:                operationsPool,
+		anchorPublicKeys:              anchorPublicKeys,
 	}, nil
 }
 

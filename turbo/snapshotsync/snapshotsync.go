@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/ledgerwatch/erigon-lib/chain"
+	"github.com/ledgerwatch/erigon-lib/chain/snapcfg"
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/erigon-lib/downloader/downloadergrpc"
@@ -19,7 +21,6 @@ import (
 
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/turbo/services"
-	"github.com/ledgerwatch/erigon/turbo/snapshotsync/snapcfg"
 	"github.com/ledgerwatch/log/v3"
 )
 
@@ -125,15 +126,15 @@ func WaitForDownloader(logPrefix string, ctx context.Context, histV3 bool, agg *
 	// build all download requests
 	// builds preverified snapshots request
 	for _, p := range preverifiedBlockSnapshots {
+		if !histV3 {
+			if strings.HasPrefix(p.Name, "domain") || strings.HasPrefix(p.Name, "history") || strings.HasPrefix(p.Name, "idx") {
+				continue
+			}
+		}
+
 		_, exists := existingFilesMap[p.Name]
 		_, borExists := borExistingFilesMap[p.Name]
 		if !exists && !borExists { // Not to download existing files "behind the scenes"
-			downloadRequest = append(downloadRequest, services.NewDownloadRequest(nil, p.Name, p.Hash, false /* Bor */))
-		}
-	}
-	if histV3 {
-		preverifiedHistorySnapshots := snapcfg.KnownCfg(cc.ChainName, snInDB, snHistInDB).PreverifiedHistory
-		for _, p := range preverifiedHistorySnapshots {
 			downloadRequest = append(downloadRequest, services.NewDownloadRequest(nil, p.Name, p.Hash, false /* Bor */))
 		}
 	}
@@ -196,21 +197,23 @@ Loop:
 			} else {
 				if stats.MetadataReady < stats.FilesTotal {
 					log.Info(fmt.Sprintf("[%s] Waiting for torrents metadata: %d/%d", logPrefix, stats.MetadataReady, stats.FilesTotal))
-					//continue
+					continue
 				}
 				dbg.ReadMemStats(&m)
 				downloadTimeLeft := calculateTime(stats.BytesTotal-stats.BytesCompleted, stats.DownloadRate)
-				log.Info(fmt.Sprintf("[%s] download", logPrefix),
+				suffix := "downloading"
+				if stats.Progress > 0 && stats.DownloadRate == 0 {
+					suffix += " (or verifying)"
+				}
+				log.Info(fmt.Sprintf("[%s] %s", logPrefix, suffix),
 					"progress", fmt.Sprintf("%.2f%% %s/%s", stats.Progress, common.ByteCount(stats.BytesCompleted), common.ByteCount(stats.BytesTotal)),
-					"download-time-left", downloadTimeLeft,
-					"total-download-time", time.Since(downloadStartTime).Round(time.Second).String(),
+					"time-left", downloadTimeLeft,
+					"total-time", time.Since(downloadStartTime).Round(time.Second).String(),
 					"download", common.ByteCount(stats.DownloadRate)+"/s",
 					"upload", common.ByteCount(stats.UploadRate)+"/s",
-				)
-				log.Info(fmt.Sprintf("[%s] download", logPrefix),
 					"peers", stats.PeersUnique,
-					"connections", stats.ConnectionsTotal,
 					"files", stats.FilesTotal,
+					"connections", stats.ConnectionsTotal,
 					"alloc", common.ByteCount(m.Alloc), "sys", common.ByteCount(m.Sys),
 				)
 			}

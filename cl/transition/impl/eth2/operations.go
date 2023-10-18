@@ -39,16 +39,8 @@ func (I *impl) ProcessProposerSlashing(s abstract.BeaconState, propSlashing *clt
 		return fmt.Errorf("non-matching proposer indices proposer slashing: %d != %d", h1.ProposerIndex, h2.ProposerIndex)
 	}
 
-	h1Root, err := h1.HashSSZ()
-	if err != nil {
-		return fmt.Errorf("unable to hash header1: %v", err)
-	}
-	h2Root, err := h2.HashSSZ()
-	if err != nil {
-		return fmt.Errorf("unable to hash header2: %v", err)
-	}
-	if h1Root == h2Root {
-		return fmt.Errorf("propose slashing headers are the same: %v == %v", h1Root, h2Root)
+	if *h1 == *h2 {
+		return fmt.Errorf("proposee slashing headers are the same")
 	}
 
 	proposer, err := s.ValidatorForValidatorIndex(int(h1.ProposerIndex))
@@ -198,7 +190,7 @@ func (I *impl) ProcessDeposit(s abstract.BeaconState, deposit *cltypes.Deposit) 
 // ProcessVoluntaryExit takes a voluntary exit and applies state transition.
 func (I *impl) ProcessVoluntaryExit(s abstract.BeaconState, signedVoluntaryExit *cltypes.SignedVoluntaryExit) error {
 	// Sanity checks so that we know it is good.
-	voluntaryExit := signedVoluntaryExit.VolunaryExit
+	voluntaryExit := signedVoluntaryExit.VoluntaryExit
 	currentEpoch := state.Epoch(s)
 	validator, err := s.ValidatorForValidatorIndex(int(voluntaryExit.ValidatorIndex))
 	if err != nil {
@@ -242,7 +234,7 @@ func (I *impl) ProcessVoluntaryExit(s abstract.BeaconState, signedVoluntaryExit 
 
 // ProcessWithdrawals processes withdrawals by decreasing the balance of each validator
 // and updating the next withdrawal index and validator index.
-func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.ListSSZ[*types.Withdrawal]) error {
+func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.ListSSZ[*cltypes.Withdrawal]) error {
 	// Get the list of withdrawals, the expected withdrawals (if performing full validation),
 	// and the beacon configuration.
 	beaconConfig := s.BeaconConfig()
@@ -254,8 +246,8 @@ func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.Lis
 		if len(expectedWithdrawals) != withdrawals.Len() {
 			return fmt.Errorf("ProcessWithdrawals: expected %d withdrawals, but got %d", len(expectedWithdrawals), withdrawals.Len())
 		}
-		if err := solid.RangeErr[*types.Withdrawal](withdrawals, func(i int, w *types.Withdrawal, _ int) error {
-			if !expectedWithdrawals[i].Equal(w) {
+		if err := solid.RangeErr[*cltypes.Withdrawal](withdrawals, func(i int, w *cltypes.Withdrawal, _ int) error {
+			if *expectedWithdrawals[i] != *w {
 				return fmt.Errorf("ProcessWithdrawals: withdrawal %d does not match expected withdrawal", i)
 			}
 			return nil
@@ -264,7 +256,7 @@ func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.Lis
 		}
 	}
 
-	if err := solid.RangeErr[*types.Withdrawal](withdrawals, func(_ int, w *types.Withdrawal, _ int) error {
+	if err := solid.RangeErr[*cltypes.Withdrawal](withdrawals, func(_ int, w *cltypes.Withdrawal, _ int) error {
 		if err := state.DecreaseBalance(s, w.Validator, w.Amount); err != nil {
 			return err
 		}
